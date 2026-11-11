@@ -197,4 +197,10 @@ cython_debug/
 
 outputs/
 *.npy
+*.npz
+results/*.json
 *.svg
+*.png
+
+sweep_runs/
+runs/

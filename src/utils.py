@@ -263,6 +263,7 @@ def create_density_filter(
   cutoff_distance: float,
   filter_type: Filters = Filters.LINEAR,
   eps: float = 1e-12,
+  block: int = 1024,
 ) -> jax_sprs.BCOO:
   """Creates a density filter to smoothen out the field.
 
@@ -274,15 +275,22 @@ def create_density_filter(
     cutoff_distance: A float, the radius beyond which the filter has zero influence.
     filter_type: A string, one of 'linear', 'circular', or 'gaussian'.
     eps: A float, small value to avoid division by zero added to the entries.
+    block: Number of rows whose distances are computed at once. The full (num_pts, num_pts)
+      distance matrix is never formed (25,600^2 doubles at 160 x 160 elements); the result does
+      not depend on the block size.
 
   Returns: A BCOO sparse matrix of size (num_pts, num_pts) of the filter.
   """
   num_pts = coords.shape[0]
 
-  distances = _cdist(coords, coords)
-
-  row_indices, col_indices = jnp.where(distances <= cutoff_distance)
-  relevant_distances = distances[row_indices, col_indices]
+  # distances row block by row block, rows kept in order (same entries and order as on the full matrix)
+  rows, cols, dists = [], [], []
+  for r0 in range(0, num_pts, block):
+    distances = _cdist(coords[r0:r0 + block], coords)
+    r, c = jnp.where(distances <= cutoff_distance)
+    rows.append(r + r0); cols.append(c); dists.append(distances[r, c])
+  row_indices, col_indices = jnp.concatenate(rows), jnp.concatenate(cols)
+  relevant_distances = jnp.concatenate(dists)
 
   if filter_type == Filters.LINEAR:
     filter_values = 1.0 - (relevant_distances / cutoff_distance)

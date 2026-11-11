@@ -92,6 +92,12 @@ def _petsc_solve(
   ksp.setFromOptions()
   ksp.setType(ksp_type)
   ksp.pc.setType(pc_type)
+  opts = solver_options["petsc_solver"]
+  ksp.setTolerances(
+    rtol=opts.get("rtol", 1.0e-10),
+    atol=opts.get("atol", 1.0e-50),
+    max_it=opts.get("max_it", 10000),
+  )
 
   if ksp_type == "tfqmr":
     ksp.pc.setFactorSolverType("mumps")
@@ -99,6 +105,10 @@ def _petsc_solve(
   x = PETSc.Vec().createSeq(len(b))
   ksp.solve(rhs, x)
 
+  if ksp.getConvergedReason() < 0:
+    print(f"PETSc KSP did not converge: reason {ksp.getConvergedReason()}, "
+          f"its {ksp.getIterationNumber()}, rtol {ksp.getTolerances()[0]:.1e}")
+  
   return x.getArray()
 
 

@@ -14,9 +14,9 @@ class ThermalMaterial:
   """Linear thermal material constants.
 
   Attributes:
-    thermal_conductivity: The thermal conductivity of the material [W/(m*K)].
+    thermal_conductivity: The thermal conductivity of the material .
     specific_heat: Specific heat capacity of the material [J/(kg*K)].
-    mass_density: Mass density of material in [kg/m^3].
+    mass_density: Mass density of material in [g/cm^3].
     expansion_coefficient: Thermal expansion coefficient of the material [1/K].
   """
 
@@ -43,7 +43,7 @@ class StructuralMaterial:
   Attributes:
     youngs_modulus: The young's modulus of the material [Pa].
     poissons_ratio: The poisson's ratio of the material [-].
-    mass_density: Mass density of material in [kg/m^3].
+    mass_density: Mass density of material in [g/cm^3].
     yield_strength: Yield strength of the material [Pa].
   """
 
@@ -135,10 +135,10 @@ class FluidMaterial:
   """Linear material constants.
 
   Attributes:
-    mass_density: Mass density of the fluid [kg/m^3].
-    dynamic_viscosity: Dynamic viscosity of the fluid [Pa*s].
-    thermal_conductivity: Thermal conductivity of the fluid [W/(m*K)].
-    specific_heat: Specific heat capacity of the fluid [J/(kg*K)].
+    mass_density: Mass density of the fluid [g/cm^3].
+    dynamic_viscosity: Dynamic viscosity of the fluid [P = g/(cm*s)].
+    thermal_conductivity: Thermal conductivity of the fluid [erg/(s*cm*K)].
+    specific_heat: Specific heat capacity of the fluid [erg/(g*K)].
   """
 
   mass_density: Optional[float] = None
@@ -148,17 +148,17 @@ class FluidMaterial:
 
   @property
   def kinematic_viscosity(self) -> float:
-    """Kinematic viscosity of the fluid [m^2/s]."""
+    """Kinematic viscosity of the fluid [cm^2/s]."""
     return self.dynamic_viscosity / self.mass_density
 
   @property
   def heat_capacity(self) -> float:
-    """Heat capacity of the fluid [J/(m^3*K)]."""
+    """Heat capacity of the fluid [erg/(cm^3*K)]."""
     return self.mass_density * self.specific_heat
 
   @property
   def diffusivity(self) -> float:
-    """Thermal diffusivity of the fluid [m^2/s]."""
+    """Thermal diffusivity of the fluid [cm^2/s]."""
     return self.thermal_conductivity / self.heat_capacity
 
 
@@ -171,7 +171,7 @@ def brinkman_bound(dynamic_viscosity: float, out_of_plane_thickness: float) -> f
   half-height h (Poiseuille profile), giving
     α_min = (5 μ) / (2 h²).
 
-    here, μ is the dynamic viscosity of the fluid (Pa·s).
+    here, μ is the dynamic viscosity of the fluid (P = g/(cm·s)); h and t in cm, α in g/(cm^3·s).
 
   This implementation follows a common thickness-based bracketing heuristic
   instead: evaluate α = (5 μ) / (2 h²) at two effective out-of-plane thicknesses derived
@@ -182,9 +182,8 @@ def brinkman_bound(dynamic_viscosity: float, out_of_plane_thickness: float) -> f
   κ and thickness (κ = 2 h²/5 ⇒ α = μ/κ = 5 μ /(2 h²)).
 
   Args:
-    dynamic_viscosity : μ, dynamic viscosity of the fluid (Pa·s).
-    out_of_plane_thickness : t, out-of-plane thickness of the bracket (same units
-      as thickness).
+    dynamic_viscosity : μ, dynamic viscosity of the fluid (P = g/(cm*s)).
+    out_of_plane_thickness : t, out-of-plane thickness [cm] (same length unit as the mesh).
 
   Returns: The Brinkman penalty factor α ∈ [α_min, α_max] for the given dynamic
     viscosity and out-of-plane thickness.
@@ -323,7 +322,7 @@ class SpeciesTransportMaterial:
   """
   Mass-diffusion properties for a solute in a solvent.
 
-  D: molecular (mass) diffusivity from Fick's law, J = -D ∇c  [m^2/s].
+  D: molecular (mass) diffusivity from Fick's law, J = -D ∇c  [cm^2/s].
       Note: D is a species-solvent pair property (e.g., iodine in blood).
   """
   D: Optional[ArrayLike] = None 

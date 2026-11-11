@@ -135,8 +135,12 @@ class FluidSolver(_solv.NonlinearProblem):
     shp_fn = self.mesh.elem_template.shape_functions(gp_center)
 
     # (d)(i)m, (g)auss, (n)odes_per_elem
-    u0 = jnp.einsum("n, nd -> nd", shp_fn, velocity.reshape(-1, self.mesh.num_dim))
-    ue = jnp.einsum("nd, nd -> ", u0, u0)
+
+    # centroid velocity: u_c = Σ_n N_n(0) u_n   -> shape (d,)
+    u0 = jnp.einsum("n, nd -> d", shp_fn, velocity.reshape(-1, self.mesh.num_dim))
+    # |u_c|^2  -> scalar
+    ue = jnp.einsum("d, d -> ", u0, u0)
+
 
     inv_sq_tau1 = (4 * ue) / elem_char_length**2
     tau_3 = (self.material.mass_density * elem_char_length**2) / (
@@ -257,7 +261,7 @@ class FluidSolver(_solv.NonlinearProblem):
     )
 
     res_brink_stab = (
-      jnp.einsum("gnd, gd, gd -> gnd", grad_shp_fn, vel_gauss, vel_gauss)
+      jnp.einsum("gnj, gj, gi -> gni", grad_shp_fn, vel_gauss, vel_gauss)
       * stab_param
       * brinkman_penalty
     )
@@ -265,7 +269,7 @@ class FluidSolver(_solv.NonlinearProblem):
     res_conv_stab = (
       self.material.mass_density
       * jnp.einsum(
-        "gnd, gi, gm, gdm -> gni", grad_shp_fn, vel_gauss, vel_gauss, dvel_xy
+        "gnj, gj, gk, gik -> gni", grad_shp_fn, vel_gauss, vel_gauss, dvel_xy
       )
       * stab_param
     )
@@ -317,6 +321,7 @@ class FluidSolver(_solv.NonlinearProblem):
     self,
     press_vel: ArrayLike,
     brinkman_penalty: ArrayLike,
+    dirichlet_values: ArrayLike = None,
   ) -> tuple[ArrayLike, jax_sprs.BCOO]:
     """Compute the residual and the tangent matrix of the system of equations.
 
@@ -354,6 +359,11 @@ class FluidSolver(_solv.NonlinearProblem):
     residual = jnp.zeros((self.mesh.num_dofs,))
     residual = residual.at[self.mesh.elem_dof_mat].add(elem_residual)
     residual = residual.at[self.bc["fixed_dofs"]].set(0.0)
+    if dirichlet_values is None:
+      dirichlet_values = self.bc["dirichlet_values"]
+    residual = residual.at[self.bc["fixed_dofs"]].set(
+        press_vel[self.bc["fixed_dofs"]] - dirichlet_values
+      )
 
     # tangent stiffness
     elem_jacobian = jax.vmap(jax.jacrev(self._compute_elem_residual, argnums=0))(
@@ -363,7 +373,9 @@ class FluidSolver(_solv.NonlinearProblem):
       (elem_jacobian.flatten(), self.node_id_jac),
       shape=(self.mesh.num_dofs, self.mesh.num_dofs),
     ).T
-    assm_jac = _bc.apply_dirichlet_bc(assembled_jacobian_matrix, self.bc["fixed_dofs"])
+    assm_jac = _bc.apply_dirichlet_bc(
+      assembled_jacobian_matrix, self.bc["fixed_dofs"], zero_columns=False
+    )
     return residual, assm_jac
 
   def compute_elem_dissipated_power(

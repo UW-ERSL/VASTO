@@ -129,8 +129,12 @@ class FEA(_nlsolv.NonlinearProblem):
     shp_fn = self.mesh.elem_template.shape_functions(gp_center)
 
     # (d)(i)m, (g)auss, (n)odes_per_elem
-    u0 = jnp.einsum("n, nd -> nd", shp_fn, velocity.reshape(-1, self.mesh.num_dim))
-    ue = jnp.einsum("nd, nd -> ", u0, u0)
+
+    # centroid velocity: u_c = Σ_n N_n(0) u_n   -> shape (d,)
+    u0 = jnp.einsum("n, nd -> d", shp_fn, velocity.reshape(-1, self.mesh.num_dim))
+    # |u_c|^2  -> scalar
+    ue = jnp.einsum("d, d -> ", u0, u0)
+
 
     inv_sq_tau1 = (4 * ue) / elem_char_length**2
     tau_2 = 0.5 * delta_time
@@ -319,7 +323,7 @@ class FEA(_nlsolv.NonlinearProblem):
     assm_jac = _bc.apply_dirichlet_bc(assm_jac, self.bc["fixed_dofs"])
     return residual, assm_jac
 
-def inlet_scale_from_intervals(t, intervals_start, intervals_end, c_in=1.0):
+def inlet_scale_from_intervals(t, intervals_start, intervals_end, c_in=1.0, ramp=0.05):
     """
     For a given time t, returns c_in if t is within any of the specified intervals, else 0.0.
     This function can be used to model inlet concentration profiles that are active
@@ -329,9 +333,17 @@ def inlet_scale_from_intervals(t, intervals_start, intervals_end, c_in=1.0):
       c_in: Inlet concentration value to return if t is within any interval.
       intervals_start: Array of start times for intervals (seconds) in physical time.
       intervals_end: Array of end times for intervals (seconds) in physical time.
+      ramp: length (s) of a raised-cosine ramp 0.5(1 - cos θ) centred on each start/end time; 
+      dose per pulse stays c_in*(end - start). ramp=0 gives the original step.
+
     """
-    in_any = jnp.any((t >= intervals_start) & (t < intervals_end))
-    return jnp.where(in_any, c_in, 0.0)
+    if ramp <= 0.0:
+        in_any = jnp.any((t >= intervals_start) & (t < intervals_end))
+        return jnp.where(in_any, c_in, 0.0)
+    th_up = jnp.pi * jnp.clip((t - intervals_start) / ramp + 0.5, 0.0, 1.0)
+    th_dn = jnp.pi * jnp.clip((intervals_end - t) / ramp + 0.5, 0.0, 1.0)
+    s = jnp.minimum(0.5 * (1.0 - jnp.cos(th_up)), 0.5 * (1.0 - jnp.cos(th_dn)))
+    return c_in * jnp.max(s)
 
 def solve_transient_fea(
   fea: FEA,
@@ -420,7 +432,7 @@ def solve_transient_fea(
     # enforce BC after solve
     c = c.at[fixed].set(dirich_step)
 
-    c = jnp.clip(c, a_min=0.0)  # Concentration cannot be negative
+    #c = jnp.clip(c, a_min=0.0)  # Concentration cannot be negative
     c0_new = jax.lax.stop_gradient(c)
 
     c_hist = c_hist.at[c_step + 1, :].set(c)
@@ -433,3 +445,107 @@ def solve_transient_fea(
   _, _, c_hist, _ = jax.lax.fori_loop(0, num_time_steps, jitted_loop_body, init_val)
 
   return c_hist
+
+def solve_transient_linear(
+  fea: FEA,
+  init_concentration: ArrayLike,
+  eff_diffusivity: ArrayLike,
+  time_step_sizes_star: ArrayLike,
+  characteristic_length: ArrayLike,
+  elem_velocity: ArrayLike,
+  char_velocity: float,
+  dt_phys: ArrayLike,
+  intervals_start: ArrayLike,
+  intervals_end: ArrayLike,
+) -> ArrayLike:
+  """Linear time stepping of the transient transport problem (same discretisation as
+  `solve_transient_fea`, same arguments and return value).
+
+  For a fixed design the element residual is linear in (C_n, C_{n-1}):
+      r(C_n, C_{n-1}) = A C_n - B C_{n-1},   A = dr/dC_n,  B = -dr/dC_{n-1},
+  with A and B depending only on the velocity, the Péclet number and dt (the SUPG
+  parameter does not depend on C). A and B are therefore assembled once, and each time
+  step is a single linear solve with the existing `solve` (one A-solve forward, one
+  A^T-solve backward), instead of the modified Newton loop.
+
+  Dirichlet convention (identical to `solve_transient_fea`): at step n both the guess
+  and C_{n-1} take the new boundary value g_n at the fixed dofs, the residual rows of the
+  fixed dofs are zeroed, and A gets the same row/column zeroing with a unit diagonal
+  (`apply_dirichlet_bc`). One Newton step from that guess is exact for this linear
+  residual:
+      C_g = C_{n-1} with C_g[fixed] = g_n
+      C_n = C_g - A_bc^{-1} r_free(C_g, C_g),   r(C_g, C_g) = (A - B) C_g.
+
+  NOTE: the time step must be uniform (A and B are assembled with
+    time_step_sizes_star[0]; the SUPG parameter depends on dt, so A is not affine in dt).
+
+  Args: see `solve_transient_fea`.
+
+  Returns: Array of size (num_time_steps + 1, num_dofs) with the concentration at the
+    nodes at each time step (row 0 is the initial condition).
+  """
+  try:  # check in numpy only: under jit, even indexing a concrete array gives a tracer
+    dts = np.asarray(time_step_sizes_star)
+    if not np.allclose(dts, dts[0], rtol=1e-12, atol=0.0):
+      raise ValueError("solve_transient_linear requires uniform time steps.")
+  except jax.errors.TracerArrayConversionError:
+    pass  # traced time steps: uniformity cannot be checked here
+  dt_star = time_step_sizes_star[0]
+
+  fixed = fea.bc["fixed_dofs"]
+  dirich_on = fea.bc["dirichlet_values"]
+  dirich_off = jnp.zeros_like(dirich_on)
+
+  def inlet_scale(t):
+    return inlet_scale_from_intervals(t, intervals_start, intervals_end)
+
+  peclet_number = characteristic_length * char_velocity / eff_diffusivity
+
+  # ---- assemble A = dr/dC_n and A - B = d r(C, C)/dC once per design
+  # (r is linear, so the Jacobians do not depend on the evaluation point)
+  zeros_elem = jnp.zeros(fea.mesh.elem_dof_mat.shape)
+  res_args = (
+    zeros_elem,
+    zeros_elem,
+    elem_velocity,
+    peclet_number,
+    fea.mesh.elem_node_coords,
+    dt_star,
+    fea.mesh.elem_diag_length,
+  )
+  vmap_axes = (0, 0, 0, 0, 0, None, 0)
+  elem_a, elem_b = jax.vmap(
+    jax.jacfwd(fea._compute_elem_residual, argnums=(0, 1)), in_axes=vmap_axes
+  )(*res_args)  # {eij}: dr_i/dC_n_j and dr_i/dC_{n-1}_j  (= -B)
+
+  def assemble(elem_mat):  # same construction as get_residual_and_tangent_stiffness
+    return jax_sprs.BCOO(
+      (elem_mat.flatten(), fea.node_id_jac),
+      shape=(fea.mesh.num_dofs, fea.mesh.num_dofs),
+    ).T
+
+  a_bc = _bc.apply_dirichlet_bc(assemble(elem_a), fixed)
+  a_minus_b = assemble(elem_a + elem_b)
+
+  # ---- initial condition (as in solve_transient_fea)
+  t0_phys = 0.0
+  s0 = inlet_scale(t0_phys)
+  c_init = init_concentration.at[fixed].set(s0 * dirich_on + (1.0 - s0) * dirich_off)
+
+  def step(carry, k):
+    c_prev, t_phys = carry
+    t_next = t_phys + dt_phys[k]
+    s = inlet_scale(t_next)
+    dirich_step = s * dirich_on + (1.0 - s) * dirich_off
+
+    c_g = c_prev.at[fixed].set(dirich_step)
+    residual = (a_minus_b @ c_g).at[fixed].set(0.0)
+    delta_c = _nlsolv.solve(a_bc, residual, params=fea.solver_settings["linear"])
+    c = (c_g - delta_c).at[fixed].set(dirich_step)
+    return (c, t_next), c
+
+  num_time_steps = time_step_sizes_star.shape[0]
+  _, c_steps = jax.lax.scan(
+    step, (c_init, jnp.asarray(t0_phys)), jnp.arange(num_time_steps)
+  )
+  return jnp.concatenate([c_init[None, :], c_steps], axis=0)
